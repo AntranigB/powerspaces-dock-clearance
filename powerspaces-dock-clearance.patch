@@ -1,0 +1,675 @@
+diff --git a/Sources/PowerspacesApp/AppDelegate.swift b/Sources/PowerspacesApp/AppDelegate.swift
+index 61b63a4..1e7ccbb 100644
+--- a/Sources/PowerspacesApp/AppDelegate.swift
++++ b/Sources/PowerspacesApp/AppDelegate.swift
+@@ -709,14 +709,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+     /// reconcile which displays have a dock and refresh their contents.
+     @objc private func screensChanged() {
+         pollIdleTicks = 0
+-        refresh()
+-        // refresh() adds/removes docks but leaves survivors where they are, and a
+-        // pure geometry change doesn't alter their contents (so no rebuild → no
+-        // reposition). Re-place every surviving dock on its (possibly moved) screen
+-        // here, matching the doc-comment on the screen-change observer. A dock whose
+-        // display is still coming back has a nil boundScreen and skips safely; the
+-        // follow-up screen-change event places it once that display returns.
++        // Re-place survivors before the refresh measures their reserved work area.
++        // Newly attached displays receive a positioned Dock in reconcileDocks().
+         for dock in docks.values { dock.reposition() }
++        refresh()
+         // A display attach/rearrange can let macOS drift the Apple Dock's hidden
+         // state back (auto-hide off, or the tile size reset) — which would make it
+         // reappear full-size during App Exposé / Mission Control. Re-assert our hide.
+@@ -806,6 +802,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+         let allDisplayBounds = NSScreen.screens
+             .map { CGDisplayBounds($0.displayID) }.filter { $0 != .zero }
+         var anyChanged = false
++        var reservationAreas: [(displayID: CGDirectDisplayID, area: WindowReservation.Area)] = []
+         for (uuid, dock) in docks {
+             guard let info = displays.first(where: { $0.displayUUID == uuid }) else { continue }
+             // Authoritative live bounds for this dock's screen (the window-server
+@@ -850,9 +847,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+                 display.map { $0.withActive(($0.windowID ?? $0.windowIDs.first) == active) }
+             } ?? display
+             dock.update(apps: marked, animateChanges: !spaceChanged)
++            if prefs.reserveDockSpace, !prefs.autoHideEnabled, !info.isFullscreen,
++               let usable = dock.reservedUsableFrame(windowGap: CGFloat(prefs.reservedSpaceMargin)),
++               dock.boundScreen != nil {
++                let liveBounds = CGDisplayBounds(dock.boundDisplayID)
++                if liveBounds != .zero {
++                    reservationAreas.append((dock.boundDisplayID,
++                        WindowReservation.Area(displayBounds: liveBounds, usableBounds: usable)))
++                }
++            }
+             if marked != lastDisplayByDisplay[uuid] { anyChanged = true }
+             lastDisplayByDisplay[uuid] = marked
+         }
++        if !reservationAreas.isEmpty {
++            let areas = reservationAreas.sorted { $0.displayID < $1.displayID }.map(\.area)
++            WindowReservation.enforce(windows: snapshot.windows, areas: areas,
++                                      excludingPID: ProcessInfo.processInfo.processIdentifier)
++        }
+         return anyChanged
+     }
+ 
+diff --git a/Sources/PowerspacesApp/DockPanel.swift b/Sources/PowerspacesApp/DockPanel.swift
+index 3567f6c..6fae896 100644
+--- a/Sources/PowerspacesApp/DockPanel.swift
++++ b/Sources/PowerspacesApp/DockPanel.swift
+@@ -300,6 +300,42 @@ final class DockPanel: NSPanel {
+         max(CGFloat(Preferences.shared.dockHeight), contentCross())
+     }
+ 
++    /// The normal window work area beside the *visible bar*, excluding the native
++    /// menu bar/Dock. The transparent panel's hover and animation room is not reserved.
++    func reservedUsableFrame(windowGap: CGFloat) -> CGRect? {
++        guard let screen = boundScreen, isVisible, !fullyHidden, !autoHideActive,
++              !fullscreenActive, hideState == .shown,
++              !isAnimating, !isReordering, !isExternalDragging,
++              let visible = screen.visibleFrameInCGCoordinates else { return nil }
++        layoutIfNeeded()
++        let prefs = Preferences.shared
++        let gap = CGFloat(prefs.edgeGap)
++        guard gap.isFinite, gap >= 0, windowGap.isFinite else { return nil }
++        let position = prefs.barPosition
++        var indicatorExtent: CGFloat = 0
++        if prefs.desktopIndicatorEnabled, prefs.desktopIndicatorPosition == .aboveDock,
++           desktopIndicator.superview === container, !desktopIndicator.isHidden {
++            let indicator = container.convert(desktopIndicator.bounds, from: desktopIndicator)
++            let bar = container.convert(effect.bounds, from: effect)
++            switch position {
++            case .bottom: indicatorExtent = max(0, indicator.maxY - bar.maxY)
++            case .top:    indicatorExtent = max(0, bar.minY - indicator.minY)
++            case .left:   indicatorExtent = max(0, indicator.maxX - bar.maxX)
++            case .right:  indicatorExtent = max(0, bar.minX - indicator.minX)
++            }
++        }
++        let depth = barThickness() + gap + min(max(windowGap, 0), 32) + indicatorExtent
++        guard depth.isFinite else { return nil }
++        let edge: ReservedDockGeometry.Edge
++        switch position {
++        case .bottom: edge = .bottom
++        case .top: edge = .top
++        case .left: edge = .left
++        case .right: edge = .right
++        }
++        return ReservedDockGeometry.usableBounds(from: visible, reserving: edge, depth: depth)
++    }
++
+     /// Frames the blur to `barThickness` across and the full window length along
+     /// its axis, pinned to the window's OUTER edge so any spare window room (hover
+     /// headroom) sits on the inner side and the bar never overhangs the screen edge.
+diff --git a/Sources/PowerspacesApp/NSScreen+Display.swift b/Sources/PowerspacesApp/NSScreen+Display.swift
+index 1f15a75..4efeb7c 100644
+--- a/Sources/PowerspacesApp/NSScreen+Display.swift
++++ b/Sources/PowerspacesApp/NSScreen+Display.swift
+@@ -4,6 +4,7 @@
+ 
+ import AppKit
+ import CoreGraphics
++import SpaceKit
+ 
+ extension NSScreen {
+     /// This screen's `CGDirectDisplayID` (0 if its device description lacks the
+@@ -22,4 +23,12 @@ extension NSScreen {
+               let uuid = CFUUIDCreateString(nil, cf) as String? else { return nil }
+         return uuid
+     }
++
++    /// The native visible area in the global, top-left-origin AX/CG coordinates.
++    var visibleFrameInCGCoordinates: CGRect? {
++        guard displayID != 0 else { return nil }
++        let bounds = CGDisplayBounds(displayID)
++        return ReservedDockGeometry.visibleBounds(screenFrame: frame, visibleFrame: visibleFrame,
++                                                  displayBounds: bounds)
++    }
+ }
+diff --git a/Sources/PowerspacesApp/Preferences.swift b/Sources/PowerspacesApp/Preferences.swift
+index c691c96..5b9084a 100644
+--- a/Sources/PowerspacesApp/Preferences.swift
++++ b/Sources/PowerspacesApp/Preferences.swift
+@@ -73,6 +73,9 @@ final class Preferences: ObservableObject {
+     static let edgeGapSpec = NumericSpec(
+         presets: [("Flush (0)", 0), ("Default (12)", 12), ("Far (24)", 24)],
+         range: 0...100, step: 1, format: { "\(Int($0)) px" })
++    static let reservedSpaceMarginSpec = NumericSpec(
++        presets: [("None (0 pt)", 0), ("Default (4 pt)", 4), ("Roomy (8 pt)", 8)],
++        range: 0...32, step: 1, format: { "\(Int($0)) pt" })
+     static let cornerRadiusSpec = NumericSpec(
+         presets: [("Square (4)", 4), ("Rounded (16)", 16), ("Pill (28)", 28)],
+         range: 0...40, step: 1, format: { "\(Int($0)) px" })
+@@ -133,6 +136,7 @@ final class Preferences: ObservableObject {
+         static let iconSpacing = "iconSpacingNumber"
+         static let dockHeight = "dockHeightNumber"
+         static let edgeGap = "edgeGapNumber"
++        static let reservedSpaceMargin = "reservedSpaceMarginNumber"
+         static let cornerRadius = "barCornerRadiusNumber"
+         static let dockOutlineWidth = "dockOutlineWidthNumber"
+         static let dockOutlineColor = "dockOutlineColor"
+@@ -154,6 +158,7 @@ final class Preferences: ObservableObject {
+         static let warningCustom = "warningCustomSeconds"
+         // Non-numeric
+         static let barPosition = "barPosition"
++        static let reserveDockSpace = "reserveDockSpace"
+         static let fullscreenDockBehavior = "fullscreenDockBehavior"
+         // Which screens show a dock: "allScreens" or "selectedScreens" (then
+         // dockScreenIDs lists the chosen display UUIDs).
+@@ -230,6 +235,9 @@ final class Preferences: ObservableObject {
+             K.dockHeight: 45,
+             K.custom(K.dockHeight): true,
+             K.edgeGap: Preferences.edgeGapSpec.presetValue("Flush (0)"),
++            K.reserveDockSpace: false,
++            K.reservedSpaceMargin: Preferences.reservedSpaceMarginSpec.presetValue("Default (4 pt)"),
++            K.custom(K.reservedSpaceMargin): false,
+             K.cornerRadius: Preferences.cornerRadiusSpec.presetValue("Rounded (16)"),
+             K.dockOutlineWidth: Preferences.dockOutlineWidthSpec.presetValue("None (0)"),
+             K.dockTintEnabled: false,
+@@ -331,6 +339,17 @@ final class Preferences: ObservableObject {
+     var dockHeightCustom: Bool { get { bln(K.custom(K.dockHeight)) } set { setBln(newValue, K.custom(K.dockHeight)) } }
+     var edgeGap: Double { get { dbl(K.edgeGap) } set { setDbl(newValue, K.edgeGap) } }
+     var edgeGapCustom: Bool { get { bln(K.custom(K.edgeGap)) } set { setBln(newValue, K.custom(K.edgeGap)) } }
++    var reservedSpaceMargin: Double {
++        get {
++            let value = dbl(K.reservedSpaceMargin)
++            return value.isFinite ? min(max(value, 0), 32) : 4
++        }
++        set { setDbl(newValue.isFinite ? min(max(newValue, 0), 32) : 4, K.reservedSpaceMargin) }
++    }
++    var reservedSpaceMarginCustom: Bool {
++        get { bln(K.custom(K.reservedSpaceMargin)) }
++        set { setBln(newValue, K.custom(K.reservedSpaceMargin)) }
++    }
+     var cornerRadius: Double { get { dbl(K.cornerRadius) } set { setDbl(newValue, K.cornerRadius) } }
+     var cornerRadiusCustom: Bool { get { bln(K.custom(K.cornerRadius)) } set { setBln(newValue, K.custom(K.cornerRadius)) } }
+     /// Thickness (points) of the outline drawn around the whole dock bar (0 = off).
+@@ -354,6 +373,10 @@ final class Preferences: ObservableObject {
+     // MARK: Non-numeric properties
+ 
+     var hoverEnabled: Bool { get { bln(K.hoverEnabled) } set { setBln(newValue, K.hoverEnabled) } }
++    var reserveDockSpace: Bool {
++        get { bln(K.reserveDockSpace) }
++        set { setBln(newValue, K.reserveDockSpace) }
++    }
+     var warningsEnabled: Bool { get { bln(K.warningsEnabled) } set { setBln(newValue, K.warningsEnabled) } }
+     var barPosition: BarPosition { get { raw(K.barPosition, .bottom) } set { setRaw(newValue, K.barPosition) } }
+     /// How the per-desktop dock behaves on a screen showing a full-screen app
+diff --git a/Sources/PowerspacesApp/PreferencesView.swift b/Sources/PowerspacesApp/PreferencesView.swift
+index e4cf005..cf9b4eb 100644
+--- a/Sources/PowerspacesApp/PreferencesView.swift
++++ b/Sources/PowerspacesApp/PreferencesView.swift
+@@ -188,6 +188,9 @@ struct PreferencesView: View {
+         .init(name: "Dock color / tint", tab: 0, keywords: "tint colour background"),
+         .init(name: "Dock outline", tab: 0, keywords: "border"),
+         .init(name: "Auto-hide the dock", tab: 0, keywords: "hide reveal"),
++        .init(name: "Keep windows clear of the dock", tab: 0,
++              keywords: "overlap reserved space maximize window clearance"),
++        .init(name: "Window gap", tab: 0, keywords: "margin reserved space dock window clearance"),
+         .init(name: "Dock on full-screen apps", tab: 0, keywords: "fullscreen full screen hide show auto-hide"),
+         .init(name: "Current-desktop indicator", tab: 0, keywords: "badge number space"),
+         .init(name: "Icon size", tab: 1, keywords: "big small"),
+@@ -387,6 +390,24 @@ struct PreferencesView: View {
+                 Text("Move the pointer to the screen edge the bar hugs (bottom, top, left, or "
+                      + "right, matching its Position) to bring it back.")
+             }
++            Section {
++                Toggle("Keep windows clear of the dock", isOn: bind(\.reserveDockSpace))
++                    .help("Move or resize normal application windows when necessary so they "
++                          + "do not overlap an always-visible Powerspaces Dock.")
++                if advanced && prefs.reserveDockSpace {
++                    NumericRow(title: "Window gap",
++                               help: "Extra space between normal windows and the dock, in points.",
++                               spec: Preferences.reservedSpaceMarginSpec,
++                               value: bind(\.reservedSpaceMargin),
++                               isCustom: bind(\.reservedSpaceMarginCustom))
++                        .disabled(prefs.autoHideEnabled)
++                }
++            } header: {
++                Text("Window clearance")
++            } footer: {
++                Text("Applies to ordinary desktops, not native full-screen or Split View. "
++                     + "Inactive while ‘Hide the dock automatically’ is enabled.")
++            }
+             Section {
+                 enumPicker("On full-screen apps",
+                            help: "What the per-desktop dock does on a screen that's showing a "
+diff --git a/Sources/SpaceKit/WindowAX.swift b/Sources/SpaceKit/WindowAX.swift
+index 23ae395..8f3c13e 100644
+--- a/Sources/SpaceKit/WindowAX.swift
++++ b/Sources/SpaceKit/WindowAX.swift
+@@ -91,6 +91,45 @@ enum WindowAX {
+         }
+     }
+ 
++    /// Reservation-only write: avoid redundant attributes and let an oversized
++    /// window shrink before moving it into the smaller usable rectangle.
++    @discardableResult
++    static func setFrame(_ frame: CGRect, of window: AXUIElement, from current: CGRect) -> Bool {
++        guard frame.width <= current.width, frame.height <= current.height else { return false }
++        let move = frame.origin != current.origin
++        let resize = frame.size != current.size
++        guard move || resize else { return true }
++        if move && !isSettable(kAXPositionAttribute as CFString, of: window) { return false }
++        if resize && !isSettable(kAXSizeAttribute as CFString, of: window) { return false }
++        if resize {
++            var size = frame.size
++            guard let value = AXValueCreate(.cgSize, &size),
++                  AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value) == .success
++            else { return false }
++        }
++        if move {
++            var origin = frame.origin
++            guard let value = AXValueCreate(.cgPoint, &origin),
++                  AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value) == .success
++            else { return false }
++        }
++        return true
++    }
++
++    private static func isSettable(_ attribute: CFString, of window: AXUIElement) -> Bool {
++        var settable: DarwinBoolean = false
++        return AXUIElementIsAttributeSettable(window, attribute, &settable) == .success
++            && settable.boolValue
++    }
++
++    /// A live backstop for a full-screen transition between snapshot and AX read.
++    static func isFullscreen(_ window: AXUIElement) -> Bool {
++        var ref: CFTypeRef?
++        guard AXUIElementCopyAttributeValue(window, "AXFullScreen" as CFString, &ref) == .success,
++              let value = ref, CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
++        return CFBooleanGetValue((value as! CFBoolean))
++    }
++
+     static func minimize(_ window: AXUIElement) {
+         AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
+     }
+@@ -103,9 +142,14 @@ enum WindowAX {
+ 
+     /// Whether a window is currently minimized (sitting in the Dock).
+     static func isMinimized(_ window: AXUIElement) -> Bool {
++        minimizedState(of: window) ?? false
++    }
++
++    /// Reservation must skip a window when AX cannot confirm its live state.
++    static func minimizedState(of window: AXUIElement) -> Bool? {
+         var ref: CFTypeRef?
+         guard AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &ref) == .success,
+-              let value = ref, CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
++              let value = ref, CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+         return CFBooleanGetValue((value as! CFBoolean))
+     }
+ 
+diff --git a/Sources/SpaceKitTestRunner/main.swift b/Sources/SpaceKitTestRunner/main.swift
+index 12fabaf..f0bb4a4 100644
+--- a/Sources/SpaceKitTestRunner/main.swift
++++ b/Sources/SpaceKitTestRunner/main.swift
+@@ -1374,6 +1374,199 @@ h.test("single display: a window on it never moves") {
+     h.ok(DisplayPlacement.reposition(window: onLeft, displays: [left], active: left) == nil)
+ }
+ 
++// MARK: - Reserved Dock work area and window correction
++
++print("ReservedDockGeometry")
++let clearArea = CGRect(x: 0, y: 24, width: 1200, height: 700)
++let correctionCases: [(String, CGRect, CGRect, CGRect?)] = [
++    ("already inside", clearArea, CGRect(x: 100, y: 100, width: 900, height: 600), nil),
++    ("bottom overlap moves", clearArea, CGRect(x: 100, y: 154, width: 900, height: 600),
++     CGRect(x: 100, y: 124, width: 900, height: 600)),
++    ("bottom oversized height shrinks", clearArea, CGRect(x: 0, y: 24, width: 1200, height: 776),
++     CGRect(x: 0, y: 24, width: 1200, height: 700)),
++    ("top overlap", CGRect(x: 0, y: 100, width: 1200, height: 700),
++     CGRect(x: 100, y: 70, width: 900, height: 600),
++     CGRect(x: 100, y: 100, width: 900, height: 600)),
++    ("left overlap", CGRect(x: 80, y: 24, width: 1120, height: 776),
++     CGRect(x: 50, y: 100, width: 900, height: 600),
++     CGRect(x: 80, y: 100, width: 900, height: 600)),
++    ("right overlap", CGRect(x: 0, y: 24, width: 1120, height: 776),
++     CGRect(x: 250, y: 100, width: 900, height: 600),
++     CGRect(x: 220, y: 100, width: 900, height: 600)),
++    ("oversized in both dimensions", CGRect(x: 80, y: 100, width: 1040, height: 600),
++     CGRect(x: 0, y: 0, width: 1500, height: 1000),
++     CGRect(x: 80, y: 100, width: 1040, height: 600)),
++    ("preserves smaller dimensions", clearArea, CGRect(x: 1100, y: 650, width: 200, height: 100),
++     CGRect(x: 1000, y: 624, width: 200, height: 100)),
++    ("clamps partially offscreen", clearArea, CGRect(x: -20, y: 10, width: 300, height: 200),
++     CGRect(x: 0, y: 24, width: 300, height: 200)),
++    ("positive display origin", CGRect(x: 1920, y: 24, width: 1200, height: 700),
++     CGRect(x: 2020, y: 154, width: 900, height: 600),
++     CGRect(x: 2020, y: 124, width: 900, height: 600)),
++    ("display above primary", CGRect(x: 0, y: -876, width: 1440, height: 800),
++     CGRect(x: 100, y: -650, width: 900, height: 600),
++     CGRect(x: 100, y: -676, width: 900, height: 600)),
++    ("display below primary", CGRect(x: 0, y: 1104, width: 1440, height: 800),
++     CGRect(x: 100, y: 1350, width: 900, height: 600),
++     CGRect(x: 100, y: 1304, width: 900, height: 600)),
++]
++for (name, usable, window, expected) in correctionCases {
++    h.test(name) {
++        let actual = ReservedDockGeometry.constrain(window: window, into: usable)
++        h.eq(actual, expected)
++        if let actual {
++            h.ok(actual.width <= window.width && actual.height <= window.height, "never enlarge")
++            h.ok(ReservedDockGeometry.constrain(window: actual, into: usable) == nil, "idempotent")
++        }
++    }
++}
++h.test("fractional coordinates remain fractional and tiny corrections are ignored") {
++    let area = CGRect(x: 0.25, y: 0.25, width: 100.5, height: 100.5)
++    h.eq(ReservedDockGeometry.constrain(
++        window: CGRect(x: 1.25, y: 50.75, width: 20.5, height: 60.5), into: area),
++        CGRect(x: 1.25, y: 40.25, width: 20.5, height: 60.5))
++    h.ok(ReservedDockGeometry.constrain(
++        window: CGRect(x: 1, y: 1, width: 50, height: 100.1),
++        into: CGRect(x: 0, y: 0, width: 100, height: 101)) == nil)
++    h.ok(ReservedDockGeometry.constrain(
++        window: CGRect(x: 1, y: 1, width: 50, height: 100.6),
++        into: CGRect(x: 0, y: 0, width: 100, height: 101)) != nil)
++}
++h.test("rejects invalid rectangles and never enlarges across varied windows") {
++    for invalid in [CGRect.zero, CGRect.null,
++                    CGRect(x: 0, y: 0, width: -1, height: 10),
++                    CGRect(x: CGFloat.nan, y: 0, width: 10, height: 10),
++                    CGRect(x: 0, y: 0, width: CGFloat.infinity, height: 10)] {
++        h.ok(ReservedDockGeometry.constrain(window: invalid, into: clearArea) == nil,
++             "invalid window: \(invalid)")
++        h.ok(ReservedDockGeometry.constrain(window: clearArea, into: invalid) == nil,
++             "invalid work area: \(invalid)")
++    }
++    for x in [-100.0, 0, 400, 1100] {
++        for y in [-100.0, 24, 650] {
++            for width in [100.0, 900, 1800] {
++                for height in [100.0, 600, 900] {
++                    let window = CGRect(x: x, y: y, width: width, height: height)
++                    if let result = ReservedDockGeometry.constrain(window: window, into: clearArea) {
++                        h.ok(result.width <= window.width && result.height <= window.height)
++                        h.ok(ReservedDockGeometry.constrain(window: result, into: clearArea) == nil)
++                    }
++                }
++            }
++        }
++    }
++}
++h.test("all edges reserve only the chosen axis; margin adds depth") {
++    let base = CGRect(x: 0, y: 24, width: 1200, height: 776)
++    h.eq(ReservedDockGeometry.usableBounds(from: base, reserving: .bottom, depth: 72),
++         CGRect(x: 0, y: 24, width: 1200, height: 704))
++    h.eq(ReservedDockGeometry.usableBounds(from: base, reserving: .bottom, depth: 76),
++         CGRect(x: 0, y: 24, width: 1200, height: 700))
++    h.eq(ReservedDockGeometry.usableBounds(from: base, reserving: .bottom, depth: 104),
++         CGRect(x: 0, y: 24, width: 1200, height: 672))
++    h.eq(ReservedDockGeometry.usableBounds(from: base, reserving: .top, depth: 76),
++         CGRect(x: 0, y: 100, width: 1200, height: 700))
++    h.eq(ReservedDockGeometry.usableBounds(from: base, reserving: .left, depth: 76),
++         CGRect(x: 76, y: 24, width: 1124, height: 776))
++    h.eq(ReservedDockGeometry.usableBounds(from: base, reserving: .right, depth: 76),
++         CGRect(x: 0, y: 24, width: 1124, height: 776))
++    for depth in [-1.0, .nan, .infinity, 776, 1000] as [CGFloat] {
++        h.ok(ReservedDockGeometry.usableBounds(from: base, reserving: .bottom, depth: depth) == nil,
++             "invalid depth: \(depth)")
++    }
++}
++h.test("visible frame conversion handles stacked and offset displays") {
++    let cases: [(CGRect, CGRect, CGRect, CGRect)] = [
++        (CGRect(x: 0, y: 0, width: 1440, height: 900),
++         CGRect(x: 0, y: 40, width: 1440, height: 836),
++         CGRect(x: 0, y: 0, width: 1440, height: 900),
++         CGRect(x: 0, y: 24, width: 1440, height: 836)),
++        (CGRect(x: 0, y: 900, width: 1920, height: 1080),
++         CGRect(x: 10, y: 930, width: 1890, height: 1026),
++         CGRect(x: 0, y: -1080, width: 1920, height: 1080),
++         CGRect(x: 10, y: -1056, width: 1890, height: 1026)),
++        (CGRect(x: 0, y: -1200, width: 1920, height: 1200),
++         CGRect(x: 0, y: -1160, width: 1920, height: 1136),
++         CGRect(x: 0, y: 900, width: 1920, height: 1200),
++         CGRect(x: 0, y: 924, width: 1920, height: 1136)),
++        (CGRect(x: -1280, y: 0, width: 1280, height: 800),
++         CGRect(x: -1270, y: 20, width: 1250, height: 760),
++         CGRect(x: -1280, y: 0, width: 1280, height: 800),
++         CGRect(x: -1270, y: 20, width: 1250, height: 760)),
++    ]
++    for (screen, visible, display, expected) in cases {
++        h.eq(ReservedDockGeometry.visibleBounds(screenFrame: screen, visibleFrame: visible,
++                                                 displayBounds: display), expected)
++    }
++    h.eq(ReservedDockGeometry.visibleBounds(screenFrame: clearArea, visibleFrame: clearArea,
++                                             displayBounds: clearArea), clearArea)
++    h.ok(ReservedDockGeometry.visibleBounds(screenFrame: clearArea,
++                                             visibleFrame: CGRect(x: -10, y: 24, width: 1200, height: 700),
++                                             displayBounds: clearArea) == nil)
++}
++
++// MARK: - WindowReservation's pure candidate and kind filters
++
++print("WindowReservation")
++let reservationDisplay = CGRect(x: 0, y: 0, width: 1200, height: 800)
++func reservationWindow(_ id: CGWindowID = 1, pid: pid_t = 100,
++                       bounds: CGRect = CGRect(x: 100, y: 154, width: 900, height: 600),
++                       onscreen: Bool = true, minimized: Bool = false,
++                       hidden: Bool = false, spaces: [SpaceID] = [55]) -> WindowInfo {
++    WindowInfo(windowID: id, pid: pid, ownerName: "Example", bundleID: "example.app",
++               spaceIDs: spaces, bounds: bounds, isOnscreen: onscreen,
++               isMinimized: minimized, isHidden: hidden)
++}
++func reservationCandidate(_ window: WindowInfo, display: CGRect = reservationDisplay,
++                          usable: CGRect = clearArea) -> Bool {
++    WindowReservation.isCandidate(window, displayBounds: display, usableBounds: usable,
++                                  excludingPID: 999)
++}
++h.test("snapshot candidate requires visible offending window on its display") {
++    h.ok(reservationCandidate(reservationWindow()))
++    h.ok(!reservationCandidate(reservationWindow(bounds: CGRect(x: 100, y: 100, width: 900, height: 600))))
++    h.ok(!reservationCandidate(reservationWindow(pid: 999)))
++    h.ok(!reservationCandidate(reservationWindow(pid: 0)))
++    h.ok(!reservationCandidate(reservationWindow(0)))
++    h.ok(!reservationCandidate(reservationWindow(onscreen: false)))
++    h.ok(!reservationCandidate(reservationWindow(minimized: true)))
++    h.ok(!reservationCandidate(reservationWindow(hidden: true)))
++    h.ok(!reservationCandidate(reservationWindow(onscreen: true, minimized: true, hidden: true)))
++    h.ok(!reservationCandidate(reservationWindow(bounds: .zero)))
++    h.ok(reservationCandidate(reservationWindow(spaces: [999])),
++         "other displays can show different Space IDs")
++}
++h.test("candidate display ownership uses center and half-open edges") {
++    let right = CGRect(x: 1200, y: 0, width: 1200, height: 800)
++    let rightUsable = CGRect(x: 1200, y: 24, width: 1200, height: 700)
++    let boundary = reservationWindow(bounds: CGRect(x: 1150, y: 700, width: 100, height: 100))
++    h.ok(!reservationCandidate(boundary), "center on maxX belongs to next display")
++    h.ok(reservationCandidate(boundary, display: right, usable: rightUsable))
++    let mostlyOnLeft = reservationWindow(bounds: CGRect(x: 1100, y: 700, width: 120, height: 100))
++    h.ok(!reservationCandidate(mostlyOnLeft, display: right, usable: rightUsable))
++    let above = CGRect(x: 0, y: -900, width: 1200, height: 900)
++    let aboveUsable = CGRect(x: 0, y: -876, width: 1200, height: 800)
++    h.ok(reservationCandidate(reservationWindow(bounds: CGRect(x: 100, y: -650, width: 900, height: 600)),
++                              display: above, usable: aboveUsable))
++    let below = CGRect(x: 0, y: 800, width: 1200, height: 900)
++    let belowUsable = CGRect(x: 0, y: 824, width: 1200, height: 800)
++    h.ok(reservationCandidate(reservationWindow(bounds: CGRect(x: 100, y: 1050, width: 900, height: 600)),
++                              display: below, usable: belowUsable))
++    h.ok(!reservationCandidate(reservationWindow(), usable: CGRect(x: 0, y: 0, width: 1201, height: 800)))
++}
++h.test("reservation limits AX correction to standard nonmodal windows") {
++    h.ok(WindowReservation.isOrdinaryWindow(role: "AXWindow", subrole: "AXStandardWindow", isModal: false))
++    let excludedKinds: [(String?, String?, Bool)] = [
++        ("AXSheet", nil, false), ("AXWindow", "AXDialog", false),
++        ("AXWindow", "AXSystemDialog", false), ("AXWindow", "AXFloatingWindow", false),
++        ("AXWindow", "AXUnknown", false), ("AXWindow", nil, false),
++        (nil, "AXStandardWindow", false), ("AXWindow", "AXStandardWindow", true),
++    ]
++    for (role, subrole, modal) in excludedKinds {
++        h.ok(!WindowReservation.isOrdinaryWindow(role: role, subrole: subrole, isModal: modal))
++    }
++}
++
+ // MARK: - Live provider smoke (skips if CGS is unavailable)
+ 
+ print("Live provider (integration)")
+diff --git a/Sources/SpaceKit/ReservedDockGeometry.swift b/Sources/SpaceKit/ReservedDockGeometry.swift
+new file mode 100644
+index 0000000..5155095
+--- /dev/null
++++ b/Sources/SpaceKit/ReservedDockGeometry.swift
+@@ -0,0 +1,71 @@
++// Powerspaces
++// Copyright © 2026 Sebastian Panman de Wit
++// SPDX-License-Identifier: GPL-3.0-only
++
++import CoreGraphics
++
++/// Pure work-area geometry in the global, top-left-origin CG/AX coordinate space.
++public enum ReservedDockGeometry {
++    public enum Edge { case bottom, top, left, right }
++
++    /// Rectangles with usable, finite point coordinates (negative origins are valid).
++    public static func isValid(_ rect: CGRect) -> Bool {
++        !rect.isNull && !rect.isInfinite
++            && rect.origin.x.isFinite && rect.origin.y.isFinite
++            && rect.size.width.isFinite && rect.size.height.isFinite
++            && rect.size.width > 0 && rect.size.height > 0
++            && rect.maxX.isFinite && rect.maxY.isFinite
++    }
++
++    /// Translate AppKit's visible-frame insets to the display's CG bounds.
++    public static func visibleBounds(screenFrame: CGRect, visibleFrame: CGRect,
++                                     displayBounds: CGRect) -> CGRect? {
++        guard isValid(screenFrame), isValid(visibleFrame), isValid(displayBounds) else { return nil }
++        let left = visibleFrame.minX - screenFrame.minX
++        let right = screenFrame.maxX - visibleFrame.maxX
++        let bottom = visibleFrame.minY - screenFrame.minY
++        let top = screenFrame.maxY - visibleFrame.maxY
++        let insets = [left, right, bottom, top]
++        guard insets.allSatisfy({ $0.isFinite && $0 >= -0.5 }),
++              left + right < displayBounds.width,
++              top + bottom < displayBounds.height else { return nil }
++        let bounds = CGRect(x: displayBounds.minX + max(0, left),
++                            y: displayBounds.minY + max(0, top),
++                            width: displayBounds.width - max(0, left) - max(0, right),
++                            height: displayBounds.height - max(0, top) - max(0, bottom))
++        return isValid(bounds) ? bounds : nil
++    }
++
++    /// Reserve a full edge of the native visible area for Powerspaces' visible Dock.
++    public static func usableBounds(from bounds: CGRect, reserving edge: Edge,
++                                    depth: CGFloat) -> CGRect? {
++        guard isValid(bounds), depth.isFinite, depth >= 0 else { return nil }
++        var usable = bounds
++        switch edge {
++        case .bottom: usable.size.height -= depth
++        case .top:
++            usable.origin.y += depth
++            usable.size.height -= depth
++        case .left:
++            usable.origin.x += depth
++            usable.size.width -= depth
++        case .right: usable.size.width -= depth
++        }
++        return isValid(usable) ? usable : nil
++    }
++
++    /// The smallest move/resize that fits the window, or nil if already clear.
++    public static func constrain(window: CGRect, into usableBounds: CGRect) -> CGRect? {
++        guard isValid(window), isValid(usableBounds) else { return nil }
++        let width = min(window.width, usableBounds.width)
++        let height = min(window.height, usableBounds.height)
++        let x = min(max(window.minX, usableBounds.minX), usableBounds.maxX - width)
++        let y = min(max(window.minY, usableBounds.minY), usableBounds.maxY - height)
++        let corrected = CGRect(x: x, y: y, width: width, height: height)
++        guard isValid(corrected) else { return nil }
++        let differences = [corrected.minX - window.minX, corrected.minY - window.minY,
++                           corrected.maxX - window.maxX, corrected.maxY - window.maxY,
++                           corrected.width - window.width, corrected.height - window.height]
++        return differences.allSatisfy { abs($0) <= 0.5 } ? nil : corrected
++    }
++}
+diff --git a/Sources/SpaceKit/WindowReservation.swift b/Sources/SpaceKit/WindowReservation.swift
+new file mode 100644
+index 0000000..2d8e910
+--- /dev/null
++++ b/Sources/SpaceKit/WindowReservation.swift
+@@ -0,0 +1,88 @@
++// Powerspaces
++// Copyright © 2026 Sebastian Panman de Wit
++// SPDX-License-Identifier: GPL-3.0-only
++
++import AppKit
++import CoreGraphics
++
++/// Conservatively corrects ordinary visible windows through Accessibility.
++public enum WindowReservation {
++    public struct Area {
++        public let displayBounds: CGRect
++        public let usableBounds: CGRect
++
++        public init(displayBounds: CGRect, usableBounds: CGRect) {
++            self.displayBounds = displayBounds
++            self.usableBounds = usableBounds
++        }
++    }
++
++    /// A point on the shared edge of two displays belongs to just one of them.
++    private static func owns(_ point: CGPoint, on display: CGRect) -> Bool {
++        point.x >= display.minX && point.x < display.maxX
++            && point.y >= display.minY && point.y < display.maxY
++    }
++
++    private static func isValid(_ area: Area) -> Bool {
++        let d = area.displayBounds
++        let u = area.usableBounds
++        return ReservedDockGeometry.isValid(d) && ReservedDockGeometry.isValid(u)
++            && u.minX >= d.minX && u.maxX <= d.maxX
++            && u.minY >= d.minY && u.maxY <= d.maxY
++    }
++
++    /// Cheap snapshot filter. It performs no Accessibility calls.
++    public static func isCandidate(_ window: WindowInfo, displayBounds: CGRect,
++                                   usableBounds: CGRect, excludingPID: pid_t?) -> Bool {
++        let area = Area(displayBounds: displayBounds, usableBounds: usableBounds)
++        guard isValid(area), window.pid > 0, window.windowID != 0,
++              window.pid != excludingPID, window.isOnscreen,
++              !window.isMinimized, !window.isHidden,
++              ReservedDockGeometry.isValid(window.bounds),
++              owns(window.center, on: displayBounds) else { return false }
++        return ReservedDockGeometry.constrain(window: window.bounds, into: usableBounds) != nil
++    }
++
++    /// More restrictive than the Dock's window filter: utility windows may appear
++    /// in the Dock, but must never be repositioned as normal application windows.
++    public static func isOrdinaryWindow(role: String?, subrole: String?, isModal: Bool) -> Bool {
++        WindowFilter.isStandaloneWindow(role: role, subrole: subrole, isModal: isModal)
++            && subrole == "AXStandardWindow"
++    }
++
++    /// Fetch each candidate app's AX window list once across all eligible displays.
++    public static func enforce(windows: [WindowInfo], areas: [Area], excludingPID: pid_t?) {
++        guard !areas.isEmpty else { return }
++        var byPID: [pid_t: [(window: WindowInfo, area: Area)]] = [:]
++        var seen: Set<CGWindowID> = []
++        for window in windows {
++            guard !seen.contains(window.windowID),
++                  let area = areas.first(where: {
++                      isCandidate(window, displayBounds: $0.displayBounds,
++                                  usableBounds: $0.usableBounds, excludingPID: excludingPID)
++                  }) else { continue }
++            seen.insert(window.windowID)
++            byPID[window.pid, default: []].append((window, area))
++        }
++        guard !byPID.isEmpty, WindowAX.isTrusted else { return }
++
++        for (pid, candidates) in byPID {
++            guard let app = NSRunningApplication(processIdentifier: pid),
++                  app.activationPolicy == .regular, !app.isHidden, !app.isTerminated else { continue }
++            let axWindows = WindowAX.windows(of: pid)
++            for (candidate, area) in candidates {
++                guard let ax = WindowAX.firstWindow(windowID: candidate.windowID, in: axWindows),
++                      isOrdinaryWindow(role: WindowAX.role(of: ax),
++                                       subrole: WindowAX.subrole(of: ax),
++                                       isModal: WindowAX.isModal(ax)),
++                      WindowAX.minimizedState(of: ax) == false, !WindowAX.isFullscreen(ax),
++                      let live = WindowAX.frame(of: ax),
++                      ReservedDockGeometry.isValid(live),
++                      owns(CGPoint(x: live.midX, y: live.midY), on: area.displayBounds),
++                      let corrected = ReservedDockGeometry.constrain(window: live, into: area.usableBounds)
++                else { continue }
++                _ = WindowAX.setFrame(corrected, of: ax, from: live)
++            }
++        }
++    }
++}
